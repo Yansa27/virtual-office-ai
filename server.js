@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * Virtual Office — Jasvero Digital
- * Server zero-dependency: static hosting + proxy ke Hermes kanban API + login session.
- * Jalankan: node server.js   (env: PORT, HOST, HERMES_BASE)
+ * Server zero-dependency: static hosting + proxy ke Hermes kanban API + standalone mock fallback.
+ * Jalankan: node server.js (env: PORT, HOST, HERMES_BASE)
  */
 const http = require('http');
 const fs = require('fs');
@@ -17,6 +17,25 @@ const SESSION_TTL = 12 * 60 * 60 * 1000;
 
 /** sid -> { jar, username, created } */
 const sessions = new Map();
+
+/* Standalone Fallback In-Memory DB (bersih tanpa dummy data, siap terhubung ke Hermes) */
+const fallbackDB = {
+  profiles: [],
+  workflow: {
+    columns: [
+      { key: 'triage', label: 'Triage', icon: '◇' },
+      { key: 'todo', label: 'Todo', icon: '◻' },
+      { key: 'scheduled', label: 'Scheduled', icon: '⏱' },
+      { key: 'ready', label: 'Ready', icon: '▶' },
+      { key: 'running', label: 'Running', icon: '●' },
+      { key: 'blocked', label: 'Blocked', icon: '⊘' },
+      { key: 'review', label: 'Review', icon: '◎' },
+      { key: 'done', label: 'Done', icon: '✓' },
+    ],
+  },
+  projects: [],
+  tasks: [],
+};
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -58,21 +77,30 @@ function mergeSetCookie(jar, setCookies) {
   }
 }
 
-async function hermes(path, { method = 'GET', body, jar } = {}) {
+async function hermes(p, { method = 'GET', body, jar } = {}) {
   const headers = {};
   if (body) headers['Content-Type'] = 'application/json';
   if (jar) headers['Cookie'] = jarToHeader(jar);
-  const res = await fetch(HERMES + path, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-    redirect: 'manual',
-  });
-  const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
-  const text = await res.text();
-  let data = text;
-  try { data = JSON.parse(text); } catch {}
-  return { status: res.status, setCookies, data };
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 2000);
+  try {
+    const res = await fetch(HERMES + p, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      redirect: 'manual',
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+    const text = await res.text();
+    let data = text;
+    try { data = JSON.parse(text); } catch {}
+    return { ok: true, status: res.status, setCookies, data };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    return { ok: false, error: err.message };
+  }
 }
 
 function readBody(req) {
@@ -101,14 +129,81 @@ function serveStatic(res, urlPath) {
   });
 }
 
+/* Fallback Mock Handler */
+function handleFallbackKanban(rest, method, body, res) {
+  if (rest === '/workflow') {
+    return json(res, 200, fallbackDB.workflow);
+  }
+  if (rest === '/profiles') {
+    return json(res, 200, { profiles: fallbackDB.profiles });
+  }
+  if (rest === '/projects') {
+    return json(res, 200, { projects: fallbackDB.projects });
+  }
+  if (rest === '/stats') {
+    return json(res, 200, {
+      total_tasks: fallbackDB.tasks.length,
+      done_tasks: fallbackDB.tasks.filter((t) => t.status === 'done').length,
+      active_tasks: fallbackDB.tasks.filter((t) => ['running', 'ready', 'review'].includes(t.status)).length,
+    });
+  }
+  if (rest === '/board') {
+    const cols = fallbackDB.workflow.columns.map((c) => ({
+      name: c.key,
+      tasks: fallbackDB.tasks.filter((t) => t.status === c.key),
+    }));
+    return json(res, 200, { columns: cols });
+  }
+  if (rest === '/tasks' && method === 'POST') {
+    const newTask = {
+      id: 'tsk-' + Date.now().toString(36),
+      title: body.title || 'Untitled Task',
+      body: body.body || null,
+      assignee: body.assignee || null,
+      priority: body.priority || 0,
+      status: 'triage',
+      created_at: Math.floor(Date.now() / 1000),
+      updated_at: Math.floor(Date.now() / 1000),
+    };
+    fallbackDB.tasks.unshift(newTask);
+    return json(res, 200, { ok: true, task: newTask });
+  }
+  if (rest.startsWith('/tasks/')) {
+    const id = rest.slice('/tasks/'.length);
+    const idx = fallbackDB.tasks.findIndex((t) => t.id === id);
+    if (idx === -1) return json(res, 404, { error: 'Task not found' });
+    if (method === 'PATCH') {
+      const task = fallbackDB.tasks[idx];
+      if (body.status) {
+        task.status = body.status;
+        if (body.status === 'done' && !task.completed_at) {
+          task.completed_at = Math.floor(Date.now() / 1000);
+          task.latest_summary = task.latest_summary || 'Tugas selesai dikerjakan dengan hasil optimal.';
+        }
+      }
+      if (body.assignee !== undefined) task.assignee = body.assignee;
+      if (body.priority !== undefined) task.priority = body.priority;
+      if (body.title) task.title = body.title;
+      if (body.body) task.body = body.body;
+      task.updated_at = Math.floor(Date.now() / 1000);
+      return json(res, 200, { ok: true, task });
+    }
+    return json(res, 200, { ok: true, task: fallbackDB.tasks[idx] });
+  }
+  return json(res, 404, { error: 'Unknown fallback route' });
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const p = u.pathname;
 
   const cookies = parseCookies(req);
   const sid = cookies['vo_sid'];
-  const sess = sid ? sessions.get(sid) : null;
-  if (sess && Date.now() - sess.created > SESSION_TTL) sessions.delete(sid);
+  let sess = sid ? sessions.get(sid) : null;
+  if (sess && Date.now() - sess.created > SESSION_TTL) {
+    sessions.delete(sid);
+    sess = null;
+  }
 
   try {
     // ---- auth ----
@@ -118,36 +213,58 @@ const server = http.createServer(async (req, res) => {
         method: 'POST',
         body: { provider: 'basic', username: b.username, password: b.password },
       });
-      if (r.status !== 200) return json(res, 401, { error: 'Username atau password salah' });
-      const jar = {};
-      mergeSetCookie(jar, r.setCookies);
+
+      let authenticated = false;
+      let jar = {};
+      const username = b.username || 'admin';
+
+      if (r.ok && r.status === 200) {
+        authenticated = true;
+        mergeSetCookie(jar, r.setCookies);
+      } else if (!r.ok) {
+        // Hermes offline: izinkan login standalone fallback
+        authenticated = true;
+      }
+
+      if (!authenticated) {
+        return json(res, 401, { error: 'Username atau password salah' });
+      }
+
       const nsid = crypto.randomBytes(24).toString('hex');
-      sessions.set(nsid, { jar, username: b.username, created: Date.now() });
+      sessions.set(nsid, { jar, username, created: Date.now() });
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
         'Set-Cookie': `vo_sid=${nsid}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${SESSION_TTL / 1000}`,
       });
-      return res.end(JSON.stringify({ ok: true, username: b.username }));
+      return res.end(JSON.stringify({ ok: true, username }));
     }
+
     if (p === '/api/logout' && req.method === 'POST') {
       if (sid) sessions.delete(sid);
       res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'vo_sid=; HttpOnly; Path=/; Max-Age=0' });
       return res.end(JSON.stringify({ ok: true }));
     }
+
     if (p === '/api/me') {
       if (!sess) return json(res, 401, { error: 'unauthenticated' });
       return json(res, 200, { username: sess.username });
     }
 
-    // ---- proxy kanban ----
+    // ---- proxy kanban / fallback ----
     if (p.startsWith('/api/kanban/')) {
       if (!sess) return json(res, 401, { error: 'unauthenticated' });
       const rest = p.slice('/api/kanban'.length);
       const method = req.method;
       const body = ['POST', 'PATCH', 'PUT', 'DELETE'].includes(method) ? await readBody(req) : undefined;
+
       const r = await hermes('/api/plugins/kanban' + rest + (u.search || ''), { method, body, jar: sess.jar });
-      mergeSetCookie(sess.jar, r.setCookies);
-      return json(res, r.status, r.data);
+      if (r.ok) {
+        mergeSetCookie(sess.jar, r.setCookies);
+        return json(res, r.status, r.data);
+      }
+
+      // Fallback in-memory
+      return handleFallbackKanban(rest, method, body, res);
     }
 
     serveStatic(res, p);
@@ -156,4 +273,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => console.log(`Virtual Office → http://${HOST}:${PORT}`));
+server.listen(PORT, HOST, () => console.log(`Virtual Office Jasvero → http://${HOST}:${PORT}`));
