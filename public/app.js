@@ -20,9 +20,10 @@ const state = {
   hasilId: null,
   hasilDetail: null,
 
-  /* Chat System */
+  /* Chat System (riwayat dari server) */
   chatAgent: 'dev',
-  chatMessages: {},
+  chatHistory: {},
+  chatBusy: {},
 
   /* Audio Synthesizer */
   bgmActive: false,
@@ -1002,21 +1003,71 @@ function openAgentDrawer(name) {
 const DEFAULT_PRESET_MSGS = {};
 
 function getChatHistory(agentName) {
-  if (!state.chatMessages[agentName]) {
-    try {
-      const stored = localStorage.getItem('vo_chat_' + agentName);
-      state.chatMessages[agentName] = stored ? JSON.parse(stored) : [];
-    } catch {
-      state.chatMessages[agentName] = [];
-    }
-  }
-  return state.chatMessages[agentName];
+  if (!state.chatHistory[agentName]) state.chatHistory[agentName] = [];
+  return state.chatHistory[agentName];
 }
 
-function saveChatHistory(agentName) {
+function chatApi(agentName, opts = {}) {
+  return fetch('/api/chat/' + encodeURIComponent(agentName), {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+}
+
+async function loadChatHistory(agentName) {
   try {
-    localStorage.setItem('vo_chat_' + agentName, JSON.stringify(state.chatMessages[agentName] || []));
+    const r = await chatApi(agentName);
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d && d.agent === agentName) {
+      state.chatHistory[agentName] = Array.isArray(d.messages) ? d.messages : [];
+      state.chatBusy[agentName] = !!d.busy;
+    }
   } catch {}
+}
+
+async function chatPoll(agentName, text) {
+  try {
+    const r = await chatApi(agentName, { method: 'POST', body: JSON.stringify({ text }) });
+    if (r.status === 409) {
+      state.chatBusy[agentName] = false;
+      toast('Agen sedang sibuk menjawab pesan sebelumnya.', 'warn');
+      render();
+      return;
+    }
+    if (!r.ok) throw new Error('bad');
+  } catch {
+    state.chatBusy[agentName] = false;
+    const msgs = getChatHistory(agentName);
+    msgs.push({ sender: 'ai', text: 'Gagal mengirim pesan ke agen. Coba lagi.', time: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }) });
+    if (state.view === 'chat') render();
+    return;
+  }
+
+  let tries = 0;
+  const poll = setInterval(async () => {
+    tries++;
+    if (state.view !== 'chat' || tries > 180) {
+      clearInterval(poll);
+      state.chatBusy[agentName] = false;
+      if (state.view === 'chat') render();
+      return;
+    }
+    let d;
+    try {
+      const rr = await chatApi(agentName);
+      d = await rr.json();
+    } catch { return; }
+    if (!d) return;
+    state.chatHistory[agentName] = Array.isArray(d.messages) ? d.messages : [];
+    state.chatBusy[agentName] = !!d.busy;
+    if (state.view === 'chat' && state.chatAgent === agentName) {
+      render();
+      const feed = $('#chatMessages');
+      if (feed) feed.scrollTop = feed.scrollHeight;
+    }
+    if (!d.busy) clearInterval(poll);
+  }, 2000);
 }
 
 function viewChat() {
@@ -1031,6 +1082,7 @@ function viewChat() {
   const current = state.profiles.find((p) => p.name === state.chatAgent) || state.profiles[0];
   const sim = state.agentsSim[current.name] || {};
   const msgs = getChatHistory(current.name);
+  loadChatHistory(current.name);
 
   // Rekomendasi Prompt Cepat berdasarkan agen
   const suggestions = {
@@ -1103,6 +1155,12 @@ function viewChat() {
               <div class="muted small" style="margin-top:4px">Ketik instruksi atau pilih salah satu saran prompt di bawah untuk mulai berinteraksi dengan agen AI ini.</div>
             </div>
           `}
+          ${state.chatBusy[current.name] ? `
+            <div class="chat-msg ai">
+              <div class="chat-msg-av" style="background:${avatarBg(current.name)}">${esc(initials(current.name))}</div>
+              <div><div class="chat-bubble muted">⏳ ${esc(current.name)} sedang mengerjakan…</div></div>
+            </div>
+          ` : ''}
         </div>
 
         <!-- Suggestion Prompt Chips -->
@@ -1158,7 +1216,7 @@ function bindChat() {
     render();
   });
 
-  // Kirim Pesan
+  // Kirim Pesan ke agen sungguhan
   const form = $('#chatForm');
   if (form) {
     form.addEventListener('submit', (e) => {
@@ -1170,48 +1228,14 @@ function bindChat() {
 
       const now = new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
       const msgs = getChatHistory(current);
-
-      // Tambahkan pesan user
       msgs.push({ sender: 'user', text, time: now });
-      saveChatHistory(current);
+      state.chatBusy[current] = true;
       SFX.ping();
       render();
-
-      // Scroll ke bawah
       const feed = $('#chatMessages');
       if (feed) feed.scrollTop = feed.scrollHeight;
 
-      // Respon otomatis AI simulatif
-      setTimeout(() => {
-        let reply = '';
-        const lower = text.toLowerCase();
-
-        if (lower.includes('kopi') || lower.includes('ngopi') || lower.includes('pantry')) {
-          reply = `Siap! Saya langsung meluncur ke pantry cafe. Secangkir espresso hangat pas banget buat refresh fokus.`;
-          const spot = PANTRY_SPOTS[current] || PANTRY_SPOTS.default;
-          commandAgentTo(current, spot, 'pantry', '☕ Otw ambil kopi!');
-        } else if (lower.includes('rapat') || lower.includes('meeting')) {
-          reply = `Oke, saya segera ke ruang rapat. Saya bawa catatan sprint dan update deliverable terbaru.`;
-          const spot = MEETING_SPOTS[current] || MEETING_SPOTS.default;
-          commandAgentTo(current, spot, 'meeting', '📢 Menuju ruang rapat!');
-        } else if (lower.includes('status') || lower.includes('task')) {
-          const t = currentTask(current);
-          reply = t
-            ? `Saat ini saya lagi menangani task: "${t.title}". Statusnya sedang ${t.status}. Semuanya on schedule!`
-            : `Semua antrian task saya sudah selesai dengan tuntas. Saya siap kalau ada tugas baru!`;
-        } else {
-          reply = `Tentu! Pesan kamu: "${text}" sudah saya catat. Segera saya eksekusi dengan standar kualitas terbaik.`;
-        }
-
-        msgs.push({ sender: 'ai', text: reply, time: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }) });
-        saveChatHistory(current);
-        SFX.ping();
-        if (state.view === 'chat') {
-          render();
-          const f = $('#chatMessages');
-          if (f) f.scrollTop = f.scrollHeight;
-        }
-      }, 700);
+      chatPoll(current, text);
     });
   }
 

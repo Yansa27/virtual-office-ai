@@ -8,6 +8,113 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
+
+/* ---------------- Chat sungguhan ke agen Hermes ----------------
+   Pesan dari tab Chat AI dijalankan sebagai one-shot Hermes profile:
+   `hermes -p <agen> chat -q <pesan> -Q --resume <session>`.
+   Riwayat + session id disimpan di chat-state.json (di luar repo). */
+const HERMES_BIN = process.env.HERMES_BIN || '/home/ubuntu/.local/bin/hermes';
+const CHAT_STATE_FILE = path.join(__dirname, 'chat-state.json');
+const CHAT_WORKSPACES = path.join(__dirname, 'chat-workspaces');
+const CHAT_AGENTS = new Set(['pm', 'sales', 'dev', 'qa', 'marketing']);
+const CHAT_BUSY = new Set();
+const CHAT_TIMEOUT_MS = 300000;
+
+let chatState = { agents: {} };
+function loadChatState() {
+  try {
+    chatState = JSON.parse(fs.readFileSync(CHAT_STATE_FILE, 'utf8')) || { agents: {} };
+  } catch {
+    chatState = { agents: {} };
+  }
+  if (!chatState.agents) chatState.agents = {};
+  // Pesan terakhir yang belum dibalas saat server restart: beri tahu user.
+  for (const [agent, st] of Object.entries(chatState.agents)) {
+    const msgs = Array.isArray(st.messages) ? st.messages : [];
+    if (msgs.length && msgs[msgs.length - 1].sender === 'user') {
+      msgs.push({
+        sender: 'ai',
+        text: 'Sesi chat terputus (server restart). Silakan kirim ulang pesanmu.',
+        time: chatNow(),
+      });
+    }
+  }
+}
+function saveChatState() {
+  try { fs.writeFileSync(CHAT_STATE_FILE, JSON.stringify(chatState, null, 2)); } catch {}
+}
+function chatNow() {
+  const d = new Date();
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+function chatAgentState(agent) {
+  if (!chatState.agents[agent]) chatState.agents[agent] = { messages: [], session: null };
+  return chatState.agents[agent];
+}
+function cleanAgentOutput(raw) {
+  return String(raw || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .filter((l) => !/^session_id:\s*/i.test(l))
+    .filter((l) => !/^[↻⟳]/.test(l))
+    .filter((l) => !/^Model restored from session/i.test(l))
+    .join('\n')
+    .trim();
+}
+function runChatAgent(agent, text) {
+  const st = chatAgentState(agent);
+  const workspace = path.join(CHAT_WORKSPACES, agent);
+  fs.mkdirSync(workspace, { recursive: true });
+  const args = ['-p', agent, 'chat', '-q', text, '-Q', '--in', workspace];
+  if (st.session) args.push('--resume', st.session);
+
+  const env = {
+    ...process.env,
+    HERMES_PROFILE: agent,
+    HERMES_SCRATCH_DIR: process.env.HERMES_SCRATCH_DIR || '/home/ubuntu/.hermes/cache/scratch',
+    HERMES_REAL_HOME: process.env.HERMES_REAL_HOME || '/home/ubuntu',
+  };
+  delete env.HERMES_TUI;
+  delete env.HERMES_SESSION_SOURCE;
+
+  let out = '';
+  let err = '';
+  let finished = false;
+  const finish = (reply) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    st.messages.push({ sender: 'ai', text: reply, time: chatNow() });
+    if (st.messages.length > 200) st.messages = st.messages.slice(-200);
+    saveChatState();
+    CHAT_BUSY.delete(agent);
+  };
+
+  const child = spawn(HERMES_BIN, args, { cwd: workspace, env });
+  const timer = setTimeout(() => {
+    child.kill('SIGTERM');
+    finish('Agen membutuhkan waktu terlalu lama dan dihentikan. Coba lagi.');
+  }, CHAT_TIMEOUT_MS);
+
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { err += d; });
+  child.on('error', (e) => finish('Gagal menjalankan agen: ' + (e.message || e)));
+  child.on('close', (code) => {
+    const raw = out + '\n' + err;
+    const m = raw.match(/session_id:\s*([^\s]+)/i);
+    if (m) st.session = m[1];
+    let reply = cleanAgentOutput(out);
+    if (!reply) {
+      reply = code === 0
+        ? 'Agen tidak mengembalikan jawaban.'
+        : `Agen berhenti (kode ${code}). ${cleanAgentOutput(err) || 'Coba lagi.'}`;
+    }
+    finish(reply);
+  });
+}
+loadChatState();
 
 const HERMES = process.env.HERMES_BASE || 'http://127.0.0.1:9119';
 const PORT = parseInt(process.env.PORT || '9120', 10);
@@ -265,6 +372,39 @@ const server = http.createServer(async (req, res) => {
 
       // Fallback in-memory
       return handleFallbackKanban(rest, method, body, res);
+    }
+
+    // ---- chat sungguhan ke agen ----
+    if (p.startsWith('/api/chat/')) {
+      if (!sess) return json(res, 401, { error: 'unauthenticated' });
+      const agent = decodeURIComponent(p.slice('/api/chat/'.length));
+      if (!CHAT_AGENTS.has(agent)) return json(res, 404, { error: 'Agen tidak dikenal' });
+      const st = chatAgentState(agent);
+      if (req.method === 'GET') {
+        return json(res, 200, {
+          ok: true,
+          agent,
+          messages: st.messages || [],
+          session: st.session || null,
+          busy: CHAT_BUSY.has(agent),
+        });
+      }
+      if (req.method === 'POST') {
+        if (CHAT_BUSY.has(agent)) {
+          return json(res, 409, { error: 'Agen sedang sibuk menjawab pesan sebelumnya' });
+        }
+        const b = await readBody(req);
+        const text = String(b.text || '').trim();
+        if (!text) return json(res, 400, { error: 'Pesan kosong' });
+        if (text.length > 4000) return json(res, 400, { error: 'Pesan terlalu panjang (maks 4000 karakter)' });
+        st.messages.push({ sender: 'user', text, time: chatNow() });
+        if (st.messages.length > 200) st.messages = st.messages.slice(-200);
+        saveChatState();
+        CHAT_BUSY.add(agent);
+        runChatAgent(agent, text);
+        return json(res, 202, { ok: true, agent, busy: true });
+      }
+      return json(res, 405, { error: 'Method not allowed' });
     }
 
     serveStatic(res, p);
