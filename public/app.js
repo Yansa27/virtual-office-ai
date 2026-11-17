@@ -24,6 +24,9 @@ const state = {
   chatAgent: 'dev',
   chatHistory: {},
   chatBusy: {},
+  chatLog: [],
+  logFilter: 'all',
+  logTimer: null,
 
   /* Audio Synthesizer */
   bgmActive: false,
@@ -40,6 +43,7 @@ const TITLES = {
   dashboard: ['Dashboard', 'Ringkasan kantor virtual & aktivitas tim agen AI'],
   kantor: ['Kantor 2D', 'Jasvero HQ · Ruang kerja tim AI'],
   chat: ['Chat AI', 'Ruang diskusi langsung dengan setiap agen AI spesialis'],
+  log: ['Log Aktivitas', 'Riwayat tugas & percakapan yang kamu berikan ke para agen'],
   tim: ['Tim Agen', 'Daftar agen AI, keahlian spesifik, dan status kehadiran'],
   board: ['Board Kanban', 'Manajemen tugas tim — seret kartu antar kolom'],
   proyek: ['Proyek', 'Daftar proyek & inisiatif digital yang sedang berjalan'],
@@ -268,6 +272,33 @@ async function api(p, opts = {}) {
     throw new Error(msg);
   }
   return data;
+}
+
+async function fetchJson(url, opts = {}) {
+  const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  let data = null;
+  try { data = await res.json(); } catch {}
+  if (res.status === 401) { showLogin(); throw new Error('Sesi habis, login lagi.'); }
+  if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
+  return data;
+}
+
+/* Log aktivitas lintas agen (chat tugas) */
+async function loadChatLog() {
+  try {
+    const d = await fetchJson('/api/chat/log');
+    state.chatLog = Array.isArray(d.log) ? d.log : [];
+    state.chatBusy = d.busy || {};
+    if (state.view === 'log') {
+      const feed = $('#logFeed');
+      const nearBottom = feed
+        ? feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80
+        : true;
+      render();
+      const feedAfter = $('#logFeed');
+      if (feedAfter && nearBottom) feedAfter.scrollTop = feedAfter.scrollHeight;
+    }
+  } catch {}
 }
 
 async function load() {
@@ -575,9 +606,15 @@ function render() {
         if (state.view === 'monitor') render();
       } catch {}
     }, 5000);
-  } else if (state.monitorTimer) {
-    clearInterval(state.monitorTimer);
-    state.monitorTimer = null;
+  } else if (state.view === 'log') {
+    v.innerHTML = viewLog();
+    if (!state.logTimer) {
+      loadChatLog();
+      state.logTimer = setInterval(() => loadChatLog(), 4000);
+    }
+  } else {
+    if (state.monitorTimer) { clearInterval(state.monitorTimer); state.monitorTimer = null; }
+    if (state.logTimer) { clearInterval(state.logTimer); state.logTimer = null; }
   }
 }
 
@@ -1386,6 +1423,62 @@ function viewProyek() {
     </div>`;
 }
 
+/* ---------------- 6b. LOG AKTIVITAS VIEW ---------------- */
+function viewLog() {
+  const agents = (state.profiles.length
+    ? state.profiles
+    : ['pm', 'sales', 'dev', 'qa', 'marketing'].map((name) => ({ name })))
+    .filter((p) => p && p.name && p.name !== 'default');
+  const filter = state.logFilter || 'all';
+  const rows = (state.chatLog || []).filter(
+    (m) => m && m.agent && (filter === 'all' || m.agent === filter),
+  );
+
+  const chips = [
+    `<button class="log-chip ${filter === 'all' ? 'active' : ''}" data-log-filter="all">Semua</button>`,
+    ...agents.map(
+      (p) => `<button class="log-chip ${filter === p.name ? 'active' : ''}" data-log-filter="${esc(p.name)}">${esc(p.name)}</button>`,
+    ),
+  ].join('');
+
+  return `
+    <div class="log-wrap">
+      <div class="log-head">
+        <div class="log-head-txt"><span class="live-dot pulse"></span> Log live · auto-refresh 4 detik</div>
+        <div class="log-count">${rows.length} pesan</div>
+      </div>
+      <div class="log-chips">${chips}</div>
+      <div id="logFeed" class="log-feed">
+        ${rows.length
+          ? rows.map(logItem).join('')
+          : '<div class="log-empty">Belum ada log. Kirim tugas lewat Chat AI, lalu pantau di sini.</div>'}
+      </div>
+    </div>`;
+}
+
+function logItem(m) {
+  const p = state.profiles.find((x) => x.name === m.agent) || { name: m.agent };
+  const isUser = m.sender === 'user';
+  const senderLabel = isUser ? 'Kamu' : p.name;
+  const busy = state.chatBusy && state.chatBusy[m.agent];
+  return `
+    <article class="log-item ${isUser ? 'from-user' : 'from-agent'}">
+      <div class="avatar log-av" style="background:${avatarBg(m.agent)}">${esc(initials(m.agent))}</div>
+      <div class="log-body">
+        <div class="log-top">
+          <span class="log-name">${esc(p.name)}</span>
+          <span class="log-badge ${isUser ? 'b-user' : 'b-ai'}">${esc(senderLabel)}</span>
+          ${busy ? '<span class="log-badge b-busy">⏳ sibuk</span>' : ''}
+          <span class="log-time">${esc(m.time || '')}</span>
+        </div>
+        <div class="log-text">${isUser ? esc(m.text) : mdText(m.text)}</div>
+        <div class="log-actions">
+          <button class="log-chat" data-chat-agent="${esc(m.agent)}">💬 Chat ${esc(p.name)}</button>
+        </div>
+      </div>
+    </article>`;
+}
+
 /* ---------------- 7. MONITOR LIVE VIEW ---------------- */
 function viewMonitor() {
   const tasks = allTasks();
@@ -1584,6 +1677,14 @@ function bindNav() {
   $('#view').addEventListener('click', (e) => {
     const g = e.target.closest('[data-go]');
     if (g) switchView(g.dataset.go);
+
+    const lf = e.target.closest('[data-log-filter]');
+    if (lf) {
+      state.logFilter = lf.dataset.logFilter;
+      SFX.click();
+      render();
+      return;
+    }
 
     const chatTarget = e.target.closest('[data-chat-agent]');
     if (chatTarget) {

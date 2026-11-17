@@ -1,149 +1,37 @@
 #!/usr/bin/env node
 /**
  * Virtual Office — Jasvero Digital
- * Server zero-dependency: static hosting + proxy ke Hermes kanban API + standalone mock fallback.
- * Jalankan: node server.js (env: PORT, HOST, HERMES_BASE)
+ * Server zero-dependency: static hosting + proxy ke Hermes kanban API + fallback SQLite.
+ *
+ * Storage:
+ *  - SQLite (node:sqlite, WAL) di data/vo.db — chat, session, task fallback.
+ *    Menggantikan chat-state.json + fallbackDB in-memory yang rentan lost-update
+ *    dan hilang saat restart.
+ *  - env: PORT, HOST, HERMES_BASE, VO_DB_PATH, VO_ALLOW_OFFLINE_LOGIN, VO_RATELIMIT, dsb.
+ *    Lihat lib/config.js.
+ *
+ * Jalankan: node server.js
  */
+'use strict';
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
 
-/* ---------------- Chat sungguhan ke agen Hermes ----------------
-   Pesan dari tab Chat AI dijalankan sebagai one-shot Hermes profile:
-   `hermes -p <agen> chat -q <pesan> -Q --resume <session>`.
-   Riwayat + session id disimpan di chat-state.json (di luar repo). */
-const HERMES_BIN = process.env.HERMES_BIN || '/home/ubuntu/.local/bin/hermes';
-const CHAT_STATE_FILE = path.join(__dirname, 'chat-state.json');
-const CHAT_WORKSPACES = path.join(__dirname, 'chat-workspaces');
-const CHAT_AGENTS = new Set(['pm', 'sales', 'dev', 'qa', 'marketing']);
-const CHAT_BUSY = new Set();
-const CHAT_TIMEOUT_MS = 300000;
+const config = require('./lib/config');
+const { securityHeaders, sessionCookieOptions, isHttpsRequest } = require('./lib/security');
+const { createRateLimiter } = require('./lib/ratelimit');
+const { Store, migrateLegacy, newTaskId } = require('./lib/store');
+const { ChatService } = require('./lib/chat');
 
-let chatState = { agents: {} };
-function loadChatState() {
-  try {
-    chatState = JSON.parse(fs.readFileSync(CHAT_STATE_FILE, 'utf8')) || { agents: {} };
-  } catch {
-    chatState = { agents: {} };
-  }
-  if (!chatState.agents) chatState.agents = {};
-  // Pesan terakhir yang belum dibalas saat server restart: beri tahu user.
-  for (const [agent, st] of Object.entries(chatState.agents)) {
-    const msgs = Array.isArray(st.messages) ? st.messages : [];
-    if (msgs.length && msgs[msgs.length - 1].sender === 'user') {
-      msgs.push({
-        sender: 'ai',
-        text: 'Sesi chat terputus (server restart). Silakan kirim ulang pesanmu.',
-        time: chatNow(),
-      });
-    }
-  }
-}
-function saveChatState() {
-  try { fs.writeFileSync(CHAT_STATE_FILE, JSON.stringify(chatState, null, 2)); } catch {}
-}
-function chatNow() {
-  const d = new Date();
-  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
-}
-function chatAgentState(agent) {
-  if (!chatState.agents[agent]) chatState.agents[agent] = { messages: [], session: null };
-  return chatState.agents[agent];
-}
-function cleanAgentOutput(raw) {
-  return String(raw || '')
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .filter((l) => !/^session_id:\s*/i.test(l))
-    .filter((l) => !/^[↻⟳]/.test(l))
-    .filter((l) => !/^Model restored from session/i.test(l))
-    .join('\n')
-    .trim();
-}
-function runChatAgent(agent, text) {
-  const st = chatAgentState(agent);
-  const workspace = path.join(CHAT_WORKSPACES, agent);
-  fs.mkdirSync(workspace, { recursive: true });
-  const args = ['-p', agent, 'chat', '-q', text, '-Q', '--in', workspace];
-  if (st.session) args.push('--resume', st.session);
-
-  const env = {
-    ...process.env,
-    HERMES_PROFILE: agent,
-    HERMES_SCRATCH_DIR: process.env.HERMES_SCRATCH_DIR || '/home/ubuntu/.hermes/cache/scratch',
-    HERMES_REAL_HOME: process.env.HERMES_REAL_HOME || '/home/ubuntu',
-  };
-  delete env.HERMES_TUI;
-  delete env.HERMES_SESSION_SOURCE;
-
-  let out = '';
-  let err = '';
-  let finished = false;
-  const finish = (reply) => {
-    if (finished) return;
-    finished = true;
-    clearTimeout(timer);
-    st.messages.push({ sender: 'ai', text: reply, time: chatNow() });
-    if (st.messages.length > 200) st.messages = st.messages.slice(-200);
-    saveChatState();
-    CHAT_BUSY.delete(agent);
-  };
-
-  const child = spawn(HERMES_BIN, args, { cwd: workspace, env });
-  const timer = setTimeout(() => {
-    child.kill('SIGTERM');
-    finish('Agen membutuhkan waktu terlalu lama dan dihentikan. Coba lagi.');
-  }, CHAT_TIMEOUT_MS);
-
-  child.stdout.on('data', (d) => { out += d; });
-  child.stderr.on('data', (d) => { err += d; });
-  child.on('error', (e) => finish('Gagal menjalankan agen: ' + (e.message || e)));
-  child.on('close', (code) => {
-    const raw = out + '\n' + err;
-    const m = raw.match(/session_id:\s*([^\s]+)/i);
-    if (m) st.session = m[1];
-    let reply = cleanAgentOutput(out);
-    if (!reply) {
-      reply = code === 0
-        ? 'Agen tidak mengembalikan jawaban.'
-        : `Agen berhenti (kode ${code}). ${cleanAgentOutput(err) || 'Coba lagi.'}`;
-    }
-    finish(reply);
-  });
-}
-loadChatState();
-
-const HERMES = process.env.HERMES_BASE || 'http://127.0.0.1:9119';
-const PORT = parseInt(process.env.PORT || '9120', 10);
-const HOST = process.env.HOST || '0.0.0.0';
-const PUBLIC_DIR = path.join(__dirname, 'public');
-const SESSION_TTL = 12 * 60 * 60 * 1000;
-
-/** sid -> { jar, username, created } */
-const sessions = new Map();
-
-/* Standalone Fallback In-Memory DB (bersih tanpa dummy data, siap terhubung ke Hermes) */
-const fallbackDB = {
-  profiles: [],
-  workflow: {
-    columns: [
-      { key: 'triage', label: 'Triage', icon: '◇' },
-      { key: 'todo', label: 'Todo', icon: '◻' },
-      { key: 'scheduled', label: 'Scheduled', icon: '⏱' },
-      { key: 'ready', label: 'Ready', icon: '▶' },
-      { key: 'running', label: 'Running', icon: '●' },
-      { key: 'blocked', label: 'Blocked', icon: '⊘' },
-      { key: 'review', label: 'Review', icon: '◎' },
-      { key: 'done', label: 'Done', icon: '✓' },
-    ],
-  },
-  projects: [],
-  tasks: [],
+const log = {
+  info: (...a) => console.log('[vo]', ...a),
+  warn: (...a) => console.warn('[vo]', ...a),
+  error: (...a) => console.error('[vo]', ...a),
 };
 
+const PUBLIC_DIR = path.join(__dirname, 'public');
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -152,16 +40,64 @@ const MIME = {
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
   '.ico': 'image/x-icon',
   '.woff2': 'font/woff2',
 };
 
+/* ---------------- storage ---------------- */
+const store = new Store(config.dbPath);
+try {
+  store.open();
+} catch (err) {
+  log.error('Gagal membuka database:', err.message);
+  process.exit(1);
+}
+
+if (config.migrateLegacy) {
+  try {
+    const r = migrateLegacy(store, path.join(__dirname, 'chat-state.json'));
+    if (r.migrated) log.info(`Migrasi chat-state.json → ${config.dbPath}: ${r.messages} pesan, ${r.sessions} sesi`);
+    else if (r.reason !== 'file tidak ada') log.info('Migrasi legacy:', r.reason);
+  } catch (err) {
+    log.warn('Migrasi chat-state.json gagal:', err.message);
+  }
+}
+
+store.seedDefaultProfiles();
+
+const chat = new ChatService(store, config, log);
+chat.bootstrap();
+
+/* ---------------- workflow (definisi kolom, bukan data user) ---------------- */
+const WORKFLOW_COLUMNS = [
+  { key: 'triage', label: 'Triage', icon: '◇' },
+  { key: 'todo', label: 'Todo', icon: '◻' },
+  { key: 'scheduled', label: 'Scheduled', icon: '⏱' },
+  { key: 'ready', label: 'Ready', icon: '▶' },
+  { key: 'running', label: 'Running', icon: '●' },
+  { key: 'blocked', label: 'Blocked', icon: '⊘' },
+  { key: 'review', label: 'Review', icon: '◎' },
+  { key: 'done', label: 'Done', icon: '✓' },
+];
+const TASK_STATUSES = new Set(WORKFLOW_COLUMNS.map((c) => c.key));
+
+/* ---------------- HTTP helpers ---------------- */
 function send(res, status, body, headers = {}) {
   res.writeHead(status, headers);
   res.end(body);
 }
 function json(res, status, obj) {
   send(res, status, JSON.stringify(obj), { 'Content-Type': 'application/json; charset=utf-8' });
+}
+function clientIp(req) {
+  if (config.trustProxy) {
+    const xff = req.headers['x-forwarded-for'];
+    if (xff) return String(xff).split(',')[0].trim();
+  }
+  return String(req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
 }
 function parseCookies(req) {
   const out = {};
@@ -174,7 +110,7 @@ function parseCookies(req) {
   return out;
 }
 function jarToHeader(jar) {
-  return Object.entries(jar).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('; ');
+  return Object.entries(jar || {}).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('; ');
 }
 function mergeSetCookie(jar, setCookies) {
   for (const sc of setCookies || []) {
@@ -183,30 +119,43 @@ function mergeSetCookie(jar, setCookies) {
     if (i > 0) jar[first.slice(0, i).trim()] = decodeURIComponent(first.slice(i + 1).trim());
   }
 }
+function serializeCookie(name, value, opts) {
+  let s = `${name}=${value}; HttpOnly; Path=${opts.path}; SameSite=${opts.sameSite}; Max-Age=${opts.maxAge}`;
+  if (opts.secure) s += '; Secure';
+  return s;
+}
 
+const limiter = createRateLimiter(config);
+function rateLimit(res, result) {
+  const retry = Math.max(1, Math.ceil((result.resetAt - Date.now()) / 1000));
+  res.setHeader('Retry-After', String(retry));
+  json(res, 429, { error: 'Terlalu banyak percobaan. Coba lagi nanti.' });
+}
+
+/* ---------------- Hermes proxy ---------------- */
 async function hermes(p, { method = 'GET', body, jar } = {}) {
   const headers = {};
   if (body) headers['Content-Type'] = 'application/json';
   if (jar) headers['Cookie'] = jarToHeader(jar);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 2000);
+  const timeoutId = setTimeout(() => controller.abort(), config.hermesProxyTimeoutMs);
   try {
-    const res = await fetch(HERMES + p, {
+    const res = await fetch(config.hermesBase + p, {
       method,
       headers,
       body: body ? JSON.stringify(body) : undefined,
       redirect: 'manual',
       signal: controller.signal,
     });
-    clearTimeout(timeoutId);
     const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
     const text = await res.text();
     let data = text;
-    try { data = JSON.parse(text); } catch {}
+    try { data = JSON.parse(text); } catch { /* biarkan teks mentah */ }
     return { ok: true, status: res.status, setCookies, data };
   } catch (err) {
+    return { ok: false, error: err.name === 'AbortError' ? 'timeout' : err.message };
+  } finally {
     clearTimeout(timeoutId);
-    return { ok: false, error: err.message };
   }
 }
 
@@ -236,119 +185,168 @@ function serveStatic(res, urlPath) {
   });
 }
 
-/* Fallback Mock Handler */
+/* ---------------- fallback kanban (SQLite) ---------------- */
 function handleFallbackKanban(rest, method, body, res) {
-  if (rest === '/workflow') {
-    return json(res, 200, fallbackDB.workflow);
-  }
-  if (rest === '/profiles') {
-    return json(res, 200, { profiles: fallbackDB.profiles });
-  }
-  if (rest === '/projects') {
-    return json(res, 200, { projects: fallbackDB.projects });
-  }
+  if (rest === '/workflow') return json(res, 200, { columns: WORKFLOW_COLUMNS });
+  if (rest === '/profiles') return json(res, 200, { profiles: store.listProfiles() });
+  if (rest === '/projects') return json(res, 200, { projects: store.listProjects() });
+
   if (rest === '/stats') {
+    const tasks = store.listTasks();
     return json(res, 200, {
-      total_tasks: fallbackDB.tasks.length,
-      done_tasks: fallbackDB.tasks.filter((t) => t.status === 'done').length,
-      active_tasks: fallbackDB.tasks.filter((t) => ['running', 'ready', 'review'].includes(t.status)).length,
+      total_tasks: tasks.length,
+      done_tasks: tasks.filter((t) => t.status === 'done').length,
+      active_tasks: tasks.filter((t) => ['running', 'ready', 'review'].includes(t.status)).length,
     });
   }
+
   if (rest === '/board') {
-    const cols = fallbackDB.workflow.columns.map((c) => ({
+    const tasks = store.listTasks();
+    const columns = WORKFLOW_COLUMNS.map((c) => ({
       name: c.key,
-      tasks: fallbackDB.tasks.filter((t) => t.status === c.key),
+      tasks: tasks.filter((t) => t.status === c.key),
     }));
-    return json(res, 200, { columns: cols });
+    return json(res, 200, { columns });
   }
+
   if (rest === '/tasks' && method === 'POST') {
-    const newTask = {
-      id: 'tsk-' + Date.now().toString(36),
-      title: body.title || 'Untitled Task',
+    const title = String(body.title || '').trim() || 'Untitled Task';
+    const task = store.createTask({
+      id: newTaskId(),
+      title,
       body: body.body || null,
       assignee: body.assignee || null,
-      priority: body.priority || 0,
+      priority: Number.isFinite(Number(body.priority)) ? Number(body.priority) : 0,
       status: 'triage',
       created_at: Math.floor(Date.now() / 1000),
       updated_at: Math.floor(Date.now() / 1000),
-    };
-    fallbackDB.tasks.unshift(newTask);
-    return json(res, 200, { ok: true, task: newTask });
+    });
+    return json(res, 200, { ok: true, task });
   }
+
   if (rest.startsWith('/tasks/')) {
-    const id = rest.slice('/tasks/'.length);
-    const idx = fallbackDB.tasks.findIndex((t) => t.id === id);
-    if (idx === -1) return json(res, 404, { error: 'Task not found' });
-    if (method === 'PATCH') {
-      const task = fallbackDB.tasks[idx];
-      if (body.status) {
-        task.status = body.status;
+    const id = decodeURIComponent(rest.slice('/tasks/'.length));
+    const task = store.getTask(id);
+    if (!task) return json(res, 404, { error: 'Task not found' });
+
+    if (method === 'GET') return json(res, 200, { ok: true, task });
+
+    if (method === 'PATCH' || method === 'PUT') {
+      const patch = { updated_at: Math.floor(Date.now() / 1000) };
+      if (body.status !== undefined) {
+        if (!TASK_STATUSES.has(body.status)) return json(res, 400, { error: `Status tidak dikenal: ${body.status}` });
+        patch.status = body.status;
         if (body.status === 'done' && !task.completed_at) {
-          task.completed_at = Math.floor(Date.now() / 1000);
-          task.latest_summary = task.latest_summary || 'Tugas selesai dikerjakan dengan hasil optimal.';
+          patch.completed_at = Math.floor(Date.now() / 1000);
+          patch.latest_summary = task.latest_summary || 'Tugas selesai dikerjakan dengan hasil optimal.';
         }
       }
-      if (body.assignee !== undefined) task.assignee = body.assignee;
-      if (body.priority !== undefined) task.priority = body.priority;
-      if (body.title) task.title = body.title;
-      if (body.body) task.body = body.body;
-      task.updated_at = Math.floor(Date.now() / 1000);
-      return json(res, 200, { ok: true, task });
+      if (body.assignee !== undefined) patch.assignee = body.assignee;
+      if (body.priority !== undefined) {
+        const n = Number(body.priority);
+        if (!Number.isFinite(n)) return json(res, 400, { error: 'Priority harus angka' });
+        patch.priority = n;
+      }
+      if (body.title !== undefined) patch.title = String(body.title).trim() || task.title;
+      if (body.body !== undefined) patch.body = body.body;
+      if (body.latest_summary !== undefined) patch.latest_summary = body.latest_summary;
+      if (body.result !== undefined) patch.result = body.result;
+      return json(res, 200, { ok: true, task: store.updateTask(id, patch) });
     }
-    return json(res, 200, { ok: true, task: fallbackDB.tasks[idx] });
   }
+
   return json(res, 404, { error: 'Unknown fallback route' });
 }
 
+/* ---------------- session ---------------- */
+function createSession(res, req, username, jar) {
+  const sid = crypto.randomBytes(24).toString('hex');
+  store.createSession(sid, username, jar);
+  const opts = sessionCookieOptions(config, isHttpsRequest(req));
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Set-Cookie': serializeCookie('vo_sid', sid, opts),
+  });
+  res.end(JSON.stringify({ ok: true, username }));
+}
+
+function clearSessionCookie(res, req) {
+  const opts = sessionCookieOptions(config, isHttpsRequest(req));
+  return serializeCookie('vo_sid', '', { ...opts, maxAge: 0 });
+}
+
+function lookupSession(sid) {
+  if (!sid) return null;
+  const sess = store.getSession(sid);
+  if (!sess) return null;
+  if (Date.now() - sess.created > config.sessionTtlMs) {
+    store.deleteSession(sid);
+    return null;
+  }
+  return sess;
+}
+
+// Bersihkan session kedaluwarsa secara berkala.
+const sessionTimer = setInterval(() => {
+  try { store.pruneSessions(config.sessionTtlMs); } catch { /* abaikan */ }
+}, 60 * 60 * 1000);
+sessionTimer.unref?.();
+
+/* ---------------- server ---------------- */
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const p = u.pathname;
+  const ip = clientIp(req);
+
+  securityHeaders(req, res, isHttpsRequest(req));
 
   const cookies = parseCookies(req);
   const sid = cookies['vo_sid'];
-  let sess = sid ? sessions.get(sid) : null;
-  if (sess && Date.now() - sess.created > SESSION_TTL) {
-    sessions.delete(sid);
-    sess = null;
+  let sess = lookupSession(sid);
+  if (sid && !sess) {
+    // cookie ada tapi tidak valid/kedaluwarsa → bersihkan di respons ini
+    res.setHeader('Set-Cookie', clearSessionCookie(res, req));
   }
 
   try {
-    // ---- auth ----
+    /* ---- auth ---- */
     if (p === '/api/login' && req.method === 'POST') {
+      const rl = limiter.login.consume('login:' + ip);
+      if (!rl.allowed) return rateLimit(res, rl);
+
       const b = await readBody(req);
+      const username = String(b.username || '').trim();
+      const password = String(b.password || '');
+      if (!username || !password) return json(res, 400, { error: 'Username dan password wajib diisi' });
+
       const r = await hermes('/auth/password-login', {
         method: 'POST',
-        body: { provider: 'basic', username: b.username, password: b.password },
+        body: { provider: 'basic', username, password },
       });
-
-      let authenticated = false;
-      let jar = {};
-      const username = b.username || 'admin';
 
       if (r.ok && r.status === 200) {
-        authenticated = true;
+        const jar = {};
         mergeSetCookie(jar, r.setCookies);
-      } else if (!r.ok) {
-        // Hermes offline: izinkan login standalone fallback
-        authenticated = true;
+        return createSession(res, req, username, jar);
       }
 
-      if (!authenticated) {
-        return json(res, 401, { error: 'Username atau password salah' });
+      if (!r.ok) {
+        // Hermes tidak terjangkau / timeout.
+        if (config.allowOfflineLogin) {
+          // BYPASS: hanya aktif bila VO_ALLOW_OFFLINE_LOGIN=1.
+          log.warn(`login bypass offline untuk "${username}" dari ${ip} (Hermes: ${r.error})`);
+          return createSession(res, req, username, {});
+        }
+        log.warn(`login gagal, Hermes tidak terjangkau (${r.error}) dari ${ip}`);
+        return json(res, 503, { error: 'Hermes sedang tidak terjangkau. Login standalone dinonaktifkan.' });
       }
 
-      const nsid = crypto.randomBytes(24).toString('hex');
-      sessions.set(nsid, { jar, username, created: Date.now() });
-      res.writeHead(200, {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Set-Cookie': `vo_sid=${nsid}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${SESSION_TTL / 1000}`,
-      });
-      return res.end(JSON.stringify({ ok: true, username }));
+      return json(res, 401, { error: 'Username atau password salah' });
     }
 
     if (p === '/api/logout' && req.method === 'POST') {
-      if (sid) sessions.delete(sid);
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'vo_sid=; HttpOnly; Path=/; Max-Age=0' });
+      if (sid) store.deleteSession(sid);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Set-Cookie': clearSessionCookie(res, req) });
       return res.end(JSON.stringify({ ok: true }));
     }
 
@@ -357,9 +355,12 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { username: sess.username });
     }
 
-    // ---- proxy kanban / fallback ----
+    /* ---- proxy kanban / fallback SQLite ---- */
     if (p.startsWith('/api/kanban/')) {
       if (!sess) return json(res, 401, { error: 'unauthenticated' });
+      const rl = limiter.api.consume('api:' + ip);
+      if (!rl.allowed) return rateLimit(res, rl);
+
       const rest = p.slice('/api/kanban'.length);
       const method = req.method;
       const body = ['POST', 'PATCH', 'PUT', 'DELETE'].includes(method) ? await readBody(req) : undefined;
@@ -367,50 +368,92 @@ const server = http.createServer(async (req, res) => {
       const r = await hermes('/api/plugins/kanban' + rest + (u.search || ''), { method, body, jar: sess.jar });
       if (r.ok) {
         mergeSetCookie(sess.jar, r.setCookies);
+        store.updateSessionJar(sess.sid, sess.jar);
         return json(res, r.status, r.data);
       }
 
-      // Fallback in-memory
+      log.warn(`Hermes kanban tidak terjangkau (${r.error}) → fallback SQLite untuk ${method} ${rest}`);
       return handleFallbackKanban(rest, method, body, res);
     }
 
-    // ---- chat sungguhan ke agen ----
+    /* ---- log aktivitas chat lintas agen ---- */
+    if (p === '/api/chat/log') {
+      if (!sess) return json(res, 401, { error: 'unauthenticated' });
+      const agent = u.searchParams.get('agent');
+      const limitRaw = parseInt(u.searchParams.get('limit') || '120', 10);
+      const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 300) : 120;
+      return json(res, 200, {
+        ok: true,
+        log: chat.logActivity(agent || null, limit),
+        busy: Object.fromEntries(Array.from(chat.busy).map((a) => [a, true])),
+      });
+    }
+
+    /* ---- chat sungguhan ke agen ---- */
     if (p.startsWith('/api/chat/')) {
       if (!sess) return json(res, 401, { error: 'unauthenticated' });
       const agent = decodeURIComponent(p.slice('/api/chat/'.length));
-      if (!CHAT_AGENTS.has(agent)) return json(res, 404, { error: 'Agen tidak dikenal' });
-      const st = chatAgentState(agent);
+      if (!chat.isAgent(agent)) return json(res, 404, { error: 'Agen tidak dikenal' });
+
       if (req.method === 'GET') {
         return json(res, 200, {
           ok: true,
           agent,
-          messages: st.messages || [],
-          session: st.session || null,
-          busy: CHAT_BUSY.has(agent),
+          messages: chat.history(agent),
+          session: chat.session(agent),
+          busy: chat.isBusy(agent),
         });
       }
+
       if (req.method === 'POST') {
-        if (CHAT_BUSY.has(agent)) {
-          return json(res, 409, { error: 'Agen sedang sibuk menjawab pesan sebelumnya' });
-        }
+        const rl = limiter.chat.consume('chat:' + ip);
+        if (!rl.allowed) return rateLimit(res, rl);
+
         const b = await readBody(req);
         const text = String(b.text || '').trim();
         if (!text) return json(res, 400, { error: 'Pesan kosong' });
         if (text.length > 4000) return json(res, 400, { error: 'Pesan terlalu panjang (maks 4000 karakter)' });
-        st.messages.push({ sender: 'user', text, time: chatNow() });
-        if (st.messages.length > 200) st.messages = st.messages.slice(-200);
-        saveChatState();
-        CHAT_BUSY.add(agent);
-        runChatAgent(agent, text);
+
+        const r = chat.send(agent, text);
+        if (r.reason === 'busy') return json(res, 409, { error: 'Agen sedang sibuk menjawab pesan sebelumnya' });
+        if (r.reason === 'closed') return json(res, 503, { error: 'Server sedang ditutup' });
         return json(res, 202, { ok: true, agent, busy: true });
       }
+
       return json(res, 405, { error: 'Method not allowed' });
     }
 
     serveStatic(res, p);
   } catch (e) {
-    json(res, 500, { error: String((e && e.message) || e) });
+    log.error('Handler error:', e && e.stack ? e.stack : e);
+    if (!res.headersSent) json(res, 500, { error: String((e && e.message) || e) });
   }
 });
 
-server.listen(PORT, HOST, () => console.log(`Virtual Office Jasvero → http://${HOST}:${PORT}`));
+/* ---------------- graceful shutdown ---------------- */
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log.info(`${signal} diterima — menutup server & menghentikan agen...`);
+  try { server.close(); } catch { /* abaikan */ }
+  if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+  await Promise.race([
+    chat.close(4000),
+    new Promise((resolve) => setTimeout(resolve, 6000)),
+  ]);
+  clearInterval(sessionTimer);
+  try { store.close(); } catch { /* abaikan */ }
+  log.info('Server ditutup dengan bersih.');
+  process.exit(0);
+}
+process.on('SIGTERM', () => { shutdown('SIGTERM').catch((e) => { log.error(e); process.exit(1); }); });
+process.on('SIGINT', () => { shutdown('SIGINT').catch((e) => { log.error(e); process.exit(1); }); });
+process.on('unhandledRejection', (reason) => log.error('unhandledRejection:', reason));
+
+server.listen(config.port, config.host, () => {
+  log.info(`Virtual Office Jasvero → http://${config.host}:${config.port}`);
+  log.info(`DB: ${config.dbPath} · offline login: ${config.allowOfflineLogin ? 'AKTIF' : 'nonaktif'}`);
+});
+
+module.exports = { server, store, chat, config };
