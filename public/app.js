@@ -305,6 +305,7 @@ function allTasks() {
   return boardColumns().flatMap((c) => c.tasks);
 }
 function presenceFor(name) {
+  if (state.chatBusy && state.chatBusy[name]) return 'busy';
   const cols = boardColumns();
   if (cols.some((c) => c.key === 'running' && c.tasks.some((t) => t.assignee === name))) return 'busy';
   if (cols.some((c) => ['ready', 'review'].includes(c.key) && c.tasks.some((t) => t.assignee === name))) return 'on';
@@ -452,6 +453,16 @@ setInterval(() => {
     const pres = presenceFor(p.name);
     const sim = state.agentsSim[p.name];
     if (!sim || sim.walking) return;
+    if (sim.holdUntil && Date.now() < sim.holdUntil) return;
+
+    // Sedang menjawab chat: agen harus di meja, bukan ngopi/jalan-jalan
+    if (state.chatBusy && state.chatBusy[p.name]) {
+      if (sim.state !== 'desk') {
+        const desk = DESK_SPOTS[p.name] || DESK_SPOTS.default;
+        commandAgentTo(p.name, desk, 'desk', '⚡ Sedang mengerjakan pesananmu');
+      }
+      return;
+    }
 
     if (pres === 'off') {
       // Agen lagi nganggur! Berikan perilaku acak yang hidup
@@ -1026,6 +1037,28 @@ async function loadChatHistory(agentName) {
   } catch {}
 }
 
+function preserveChatComposer() {
+  const inp = $('#chatInput');
+  if (!inp) return null;
+  return {
+    value: inp.value,
+    start: inp.selectionStart,
+    end: inp.selectionEnd,
+    focused: document.activeElement === inp,
+  };
+}
+
+function restoreChatComposer(snap) {
+  if (!snap) return;
+  const inp = $('#chatInput');
+  if (!inp) return;
+  inp.value = snap.value;
+  if (snap.focused) {
+    inp.focus({ preventScroll: true });
+    try { inp.setSelectionRange(snap.start, snap.end); } catch {}
+  }
+}
+
 async function chatPoll(agentName, text) {
   try {
     const r = await chatApi(agentName, { method: 'POST', body: JSON.stringify({ text }) });
@@ -1062,11 +1095,21 @@ async function chatPoll(agentName, text) {
     state.chatHistory[agentName] = Array.isArray(d.messages) ? d.messages : [];
     state.chatBusy[agentName] = !!d.busy;
     if (state.view === 'chat' && state.chatAgent === agentName) {
-      render();
       const feed = $('#chatMessages');
-      if (feed) feed.scrollTop = feed.scrollHeight;
+      const nearBottom = feed
+        ? feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80
+        : true;
+      const snap = preserveChatComposer();
+      render();
+      restoreChatComposer(snap);
+      const feedAfter = $('#chatMessages');
+      if (feedAfter && nearBottom) feedAfter.scrollTop = feedAfter.scrollHeight;
     }
-    if (!d.busy) clearInterval(poll);
+    if (!d.busy) {
+      clearInterval(poll);
+      const sim = state.agentsSim[agentName];
+      if (sim) sim.holdUntil = Date.now() + 30000;
+    }
   }, 2000);
 }
 
@@ -1230,6 +1273,8 @@ function bindChat() {
       const msgs = getChatHistory(current);
       msgs.push({ sender: 'user', text, time: now });
       state.chatBusy[current] = true;
+      const desk = DESK_SPOTS[current] || DESK_SPOTS.default;
+      commandAgentTo(current, desk, 'desk', '⚡ Siap! Mengerjakan pesanmu…');
       SFX.ping();
       render();
       const feed = $('#chatMessages');
