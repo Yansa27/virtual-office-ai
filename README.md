@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="#-fitur-utama"><img src="https://img.shields.io/badge/Status-Active%20Development-10b981?style=for-the-badge" alt="Status"></a>
-  <a href="#-quick-start"><img src="https://img.shields.io/badge/Node.js-%3E%3D18.0-3b82f6?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js"></a>
+  <a href="#-quick-start"><img src="https://img.shields.io/badge/Node.js-%3E%3D22.5-3b82f6?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js"></a>
   <a href="#-open-contributor--cara-berkontribusi"><img src="https://img.shields.io/badge/PRs-Welcome-f59e0b?style=for-the-badge&logo=github" alt="PRs Welcome"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-8b5cf6?style=for-the-badge" alt="License"></a>
 </p>
@@ -92,8 +92,21 @@ virtual-office-ai/
 │   ├── app.js                          # Client Engine: 2D Canvas, AI Pathfinding, Chat & Kanban
 │   ├── index.html                      # Markup aplikasi, modal task & drawer agen
 │   └── styles.css                      # Sistem desain: Retro 2D + Modern Dark Glassmorphism
+├── lib/
+│   ├── config.js                       # Konfigurasi env terpusat + default aman
+│   ├── store.js                        # SQLite (node:sqlite, WAL) — chat, sesi, task
+│   ├── chat.js                         # ChatService: spawn agen + lock per agen
+│   ├── ratelimit.js                    # Token bucket login/chat/api
+│   └── security.js                     # Header keamanan, cookie, deteksi HTTPS
+├── scripts/
+│   └── migrate-legacy.js               # Migrasi manual chat-state.json → SQLite
+├── test/
+│   ├── helpers.js                      # Mock Hermes + runner server untuk test
+│   ├── store.test.js                   # Unit test storage & migrasi
+│   └── server.test.js                  # Integrasi: auth, fallback, rate limit, race
+├── data/                               # SQLite DB (dibuat otomatis, diabaikan git)
 ├── server.js                           # Node.js zero-dependency HTTP server, proxy & fallback
-├── package.json                        # Konfigurasi npm (opsional / script runner)
+├── package.json                        # Script runner + test
 ├── .gitignore                          # Aturan git ignore
 └── README.md                           # Dokumentasi proyek
 ```
@@ -103,7 +116,7 @@ virtual-office-ai/
 ## 🚀 Quick Start (Cara Menjalankan)
 
 ### Prasyarat
-- **Node.js:** Versi 18.0 atau lebih baru.
+- **Node.js:** Versi **22.5** atau lebih baru (wajib: memakai `node:sqlite` bawaan; di Node 22 memunculkan `ExperimentalWarning` yang normal).
 - Peramban web modern (Chrome, Edge, Safari, Firefox).
 
 ### 1. Clone Repositori
@@ -119,12 +132,15 @@ Server dibuat tanpa dependensi npm eksternal, sehingga Anda tidak perlu menjalan
 node server.js
 ```
 
+Data disimpan di `data/vo.db` (SQLite, mode WAL). `chat-state.json` lama otomatis dimigrasi saat boot (bisa dimatikan dengan `VO_MIGRATE_LEGACY=0`).
+
 ### 3. Buka di Browser
 Akses dashboard kantor virtual di:
 👉 **[http://localhost:9120](http://localhost:9120)**
 
 > **Catatan Login:**
-> - Jika backend **Hermes** belum aktif, sistem secara otomatis mengaktifkan mode standalone simulasi. Masukkan username `admin` dan password `admin` untuk langsung masuk.
+> - Login memakai kredensial **Hermes** (`HERMES_BASE`). Bila Hermes tidak terjangkau, login **ditolak** — bypass otomatis sengaja dinonaktifkan demi keamanan.
+> - Mode darurat hanya bisa diaktifkan eksplisit: `VO_ALLOW_OFFLINE_LOGIN=1` (catat di log setiap pemakaian).
 
 ---
 
@@ -137,6 +153,21 @@ Secara default, `server.js` dikonfigurasi untuk mem-proxy permintaan autentikasi
 | `PORT` | `9120` | Port HTTP Virtual Office |
 | `HOST` | `0.0.0.0` | Host bind address |
 | `HERMES_BASE` | `http://127.0.0.1:9119` | URL endpoint backend Hermes |
+| `HERMES_BIN` | `/home/ubuntu/.local/bin/hermes` | Binary CLI yang dipakai untuk menjalankan agen chat |
+| `VO_DB_PATH` | `data/vo.db` | Path SQLite |
+| `VO_DATA_DIR` | `data` | Direktori data |
+| `VO_MIGRATE_LEGACY` | `1` | Migrasi `chat-state.json` saat boot (idempotent) |
+| `VO_ALLOW_OFFLINE_LOGIN` | `0` | **Bypass login saat Hermes offline — sengaja default mati** |
+| `VO_HERMES_PROXY_TIMEOUT_MS` | `5000` | Timeout proxy ke Hermes sebelum jatuh ke fallback |
+| `VO_RATELIMIT` | `1` | Aktifkan rate limit login/chat/api |
+| `VO_RL_LOGIN_MAX` | `5` | Batas percobaan login per menit per IP |
+| `VO_RL_CHAT_MAX` | `20` | Batas kirim pesan chat per menit per IP |
+| `VO_RL_API_MAX` | `200` | Batas request API kanban per menit per IP |
+| `VO_TRUST_PROXY` | `0` | Percaya `X-Forwarded-For` (set `1` di balik Nginx) |
+| `VO_COOKIE_SECURE` | `auto` | `auto` = Secure bila `X-Forwarded-Proto: https` |
+| `VO_SESSION_TTL_MS` | `43200000` | Umur sesi (12 jam) |
+| `VO_CHAT_TIMEOUT_MS` | `300000` | Timeout agen chat (5 menit) |
+| `VO_CHAT_WORKSPACES` | `chat-workspaces` | Direktori workspace agen |
 
 ### Mengubah Port atau Target Hermes:
 ```bash
@@ -145,11 +176,38 @@ PORT=8080 HERMES_BASE=http://192.168.1.50:9119 node server.js
 
 ### Endpoint API yang Didukung:
 - `POST /api/login` — Autentikasi sesi melalui Hermes password login.
+- `POST /api/logout` — mengakhiri sesi.
 - `GET /api/me` — Verifikasi identitas user aktif.
+- `GET /api/chat/log` — Log aktivitas chat lintas agen.
+- `GET /api/chat/:agent` — Riwayat + status sibuk agen.
+- `POST /api/chat/:agent` — Kirim pesan ke agen (202 diterima, 409 bila agen sibuk).
 - `GET /api/kanban/board` — Mengambil data kolom dan task dari Hermes Kanban.
-- `GET /api/kanban/profiles` — Mengambil daftar agen AI aktif beserta model & spesialisasi.
+- `GET /api/kanban/workflow` · `/profiles` · `/projects` · `/stats` — Metadata kanban.
 - `POST /api/kanban/tasks` — Membuat tugas baru untuk agen.
 - `PATCH /api/kanban/tasks/:id` — Mengupdate status atau assignee tugas.
+
+> Bila Hermes tidak terjangkau, endpoint `/api/kanban/*` otomatis jatuh ke **fallback SQLite**, sehingga task yang dibuat lewat UI tidak hilang saat restart.
+
+---
+
+## 🧪 Testing
+
+```bash
+npm run check   # node --check semua file
+npm test        # 20 test: storage, migrasi, auth, fallback, rate limit, race chat, shutdown
+```
+
+Test memakai `node:test` bawaan + mock Hermes di `test/helpers.js` (tanpa dependensi tambahan). `test/server.test.js` menjalankan `server.js` sungguhan di port acak dengan DB sementara.
+
+---
+
+## 🔒 Keamanan
+
+- Cookie sesi `HttpOnly`, `SameSite=Lax`, `Secure` saat di balik HTTPS, umur 12 jam.
+- Header keamanan: `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Content-Security-Policy`, `Permissions-Policy`.
+- Rate limit token-bucket per IP untuk login, chat, dan API kanban.
+- Login bypass offline **default mati**; bila aktif, setiap pemakaian dicatat di log.
+- Validasi ukuran body (maks 1 MB) dan panjang pesan chat (maks 4000 karakter).
 
 ---
 
@@ -169,7 +227,7 @@ Proyek ini bersifat **terbuka untuk publik dan siap menerima kontribusi** dari k
    ```bash
    git checkout -b feature/nama-fitur-keren
    ```
-3. Lakukan perubahan dan pastikan kode berjalan dengan rapi (`node -c server.js` dan `node -c public/app.js`).
+3. Lakukan perubahan dan pastikan kode berjalan dengan rapi (`npm run check` dan `npm test`).
 4. Commit perubahan Anda dengan pesan yang deskriptif:
    ```bash
    git commit -m "feat: tambahkan dekorasi arcade cabinet di ruang dev"
@@ -190,6 +248,10 @@ Proyek ini bersifat **terbuka untuk publik dan siap menerima kontribusi** dari k
 - [x] Tab chat mandiri untuk masing-masing agen spesialis.
 - [x] Generator Web Audio API untuk BGM Lo-Fi retro dan SFX interaktif.
 - [x] Pembersihan data dummy dan persiapan integrasi Hermes.
+- [x] Chat state & fallback kanban dipersist ke SQLite (WAL) + migrasi `chat-state.json`.
+- [x] Bypass login offline dimatikan default, rate limit, header keamanan, cookie `Secure`.
+- [ ] Split `public/app.js` per view (ES modules) + ESLint + CI `node --check`/`npm test`.
+- [ ] HTTPS via Nginx reverse proxy (tolak HTTP plaintext).
 - [ ] Siklus Siang/Malam dinamis dengan efek pencahayaan lampu jendela (*Day/Night Lighting Layer*).
 - [ ] Fitur customisasi avatar agen oleh pengguna (*Skin / Hair Customizer*).
 - [ ] Suara bicara chiptune (*animalese-style speech blips*) saat agen membalas pesan.

@@ -1,0 +1,35 @@
+{
+  "name": "jasvero-virtual-office",
+  "version": "2.0.0",
+  "description": "Virtual Office AI 2D Retro (Stardew Valley) with autonomous agents, Kanban, and Hermes integration",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/*.test.js",
+    "test:watch": "node --watch --test test/*.test.js",
+    "check": "node --check server.js && node --check lib/*.js && node --check test/*.js && node --check public/js/*.js",
+    "lint": "eslint .",
+    "migrate": "node scripts/migrate-legacy.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "keywords": [
+    "virtual-office",
+    "ai-agents",
+    "kanban",
+    "hermes",
+    "retro",
+    "stardew-valley"
+  ],
+  "author": "Jasvero Digital <dev@jasverodigital.com>",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "@eslint/js": "^9.39.0",
+    "eslint": "^10.15.0",
+    "globals": "^16.5.0"
+  }
+}
